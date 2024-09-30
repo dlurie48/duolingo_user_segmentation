@@ -1,0 +1,524 @@
+---
+title: "User Segmentation Analysis"
+author: "David Lurie"
+date: "2024-09-27"
+output: pdf_document
+---
+
+```{r, include=F}
+library(tidyr)
+library(corrplot)
+library(kableExtra)
+library(ggplot2)
+library(factoextra)
+library(gridExtra)
+library(ggfortify)
+library(dendextend)
+library(uwot)
+library(dbscan)
+library(clustMixType)
+library(dplyr)
+```
+
+```{r, include=F}
+usage=read.csv("C:/Users/david/Downloads/survey_users_app_usage.csv")
+survey=read.csv("C:/Users/david/Downloads/survey_data.csv")
+```
+
+
+**Background**
+
+A survey was conducted among Duolingo users from May 1st to August 5th in 2022, providing us with demographic and qualitative data relating to Duolingo and language learning. Along with more quantiative usage data we can attempt to segment users into personas and groups to aid future marketing and product development work. 
+
+```{r, include=F}
+unique(survey$country)
+median(usage$n_days_on_platform)
+prop.table(table(survey$primary_language_commitment))
+prop.table(table(survey$primary_language_motivation))
+```
+
+The data consist of roughly 6000 survey respondents from 10 different countries. The average respondent was in their mid to late 20s and had been on Duolingo for slightly more than a year at the time of the survey. 18% of respondents were students, while 61% were employed to some degree.
+
+**Segmentation**
+
+In order to segment the users as precisely as possible, we will use both survey and usage data, and change the encoding of some features so they can be more easily digested by quantitative methods.
+
+```{r, include=F}
+#converting ordinal features to numerical
+
+convert_to_numeric <- function(data, scale) {
+  numeric_data <- scale[data]
+  median_value <- median(numeric_data, na.rm = TRUE)
+  numeric_data[is.na(numeric_data)] <- median_value
+  numeric_data[numeric_data==""] <- median_value
+  return(numeric_data)
+}
+
+# Scales
+income_scale <- c(
+  "$0 - $10,000" = 5000, "$11,000 - $25,000" = 18000, "$26,000 - $75,000" = 50500,
+  "$76,000 - $150,000" = 113000, "$151,000 or more" = 200000
+)
+
+commitment_scale <- c(
+  "I'm very committed to learning this language." = 4,
+  "I'm slightly committed to learning this language." = 2,
+  "I'm moderately committed to learning this language." = 3,
+  "I'm extremely committed to learning this language." = 5,
+  "I'm not at all committed to learning this language." = 1
+)
+
+age_scale <- c("18-34" = 26, "35-54" = 44.5, "Under 18" = 18, "55-74" = 64.5, "75 or older" = 75)
+
+duolingo_usage_scale <- c(
+  "Daily" = 5, "Weekly" = 4, "Monthly" = 3, "Less than once a month" = 2, "I don't use duolingo" = 1
+)
+
+proficiency_scale <- c("Advanced" = 3, "Intermediate" = 2, "Beginner" = 1)
+
+# Apply conversions
+survey$annual_income_cont <- convert_to_numeric(survey$annual_income, income_scale)
+survey$likert_cont <- convert_to_numeric(survey$primary_language_commitment, commitment_scale)
+survey$age_num <- convert_to_numeric(survey$age, age_scale)
+survey$primary_language_proficiency_num <- convert_to_numeric(survey$primary_language_proficiency, proficiency_scale)
+```
+
+```{r, include=F}
+#creating new feature
+
+usage$percent_days_active=usage$n_active_days/usage$n_days_on_platform
+```
+
+```{r, include=F}
+#converting binary factors to numerical
+
+survey$is_student <- ifelse(survey$student == "Full-time student" | survey$student == "Part-time student", 1, 0)
+survey$uses_other_resources=ifelse(survey$other_resources!="", 1,0)
+survey$employment_bin=ifelse(survey$employment_status=="Employed full-time" | survey$employment_status=="Employed part-time", 1, 0)
+```
+
+
+```{r, include=F}
+library(caret)
+
+# Identify categorical columns
+categorical_cols=c("duolingo_platform", "duolingo_usage", "gender", "primary_language_review", "primary_language_motivation")
+
+survey[categorical_cols]=lapply(survey[categorical_cols], factor)
+```
+
+```{r, include=F}
+#counting blank values
+
+blank_count <-sapply(survey[categorical_cols], function(y) sum(length(which(y==""))))
+blank_count <- data.frame(blank_count)
+blank_count
+```
+
+```{r, include=F}
+#replacing na values with median
+
+replace_na_with_median <- function(df) {
+  # Iterate through each column in the dataframe
+  for (col in names(df)) {
+    # Check if the column is numeric (includes both integer and double)
+    if (is.numeric(df[[col]])) {
+      # Check if the column has any NA values
+      if (any(is.na(df[[col]]))) {
+        # Calculate the median of non-NA values
+        col_median <- median(df[[col]], na.rm = TRUE)
+        
+        # Replace NA values with the calculated median
+        df[[col]][is.na(df[[col]])] <- col_median
+        
+        # Optionally, print a message indicating the replacement
+        cat("Replaced NA values in column", col, "with median:", col_median, "\n")
+      }
+    }
+  }
+  
+  # Return the modified dataframe
+  return(df)
+}
+
+survey=replace_na_with_median(survey)
+usage=replace_na_with_median(usage)
+```
+
+```{r, include=F}
+#replacing na values in T/F columns
+
+impute_boolean_na <- function(x) {
+  # Count TRUE and FALSE values, excluding NA
+  true_count <- sum(x, na.rm = TRUE)
+  false_count <- sum(!x, na.rm = TRUE)
+  
+  # Calculate the probability of TRUE
+  p_true <- true_count / (true_count + false_count)
+  
+  # Find NA positions
+  na_positions <- which(is.na(x))
+  
+  # Generate random TRUE/FALSE values for NA positions
+  imputed_values <- rbinom(length(na_positions), 1, p_true) == 1
+  
+  # Replace NA values with imputed values
+  x[na_positions] <- imputed_values
+  
+  return(x)
+}
+usage$purchased_subscription=impute_boolean_na(usage$purchased_subscription)
+usage$took_placement_test=impute_boolean_na(usage$took_placement_test)
+```
+
+```{r, include=F}
+#replacing blank values in categorical columns
+
+fill_blank_factors <- function(factor_column) {
+  # Identify blank entries
+  blank_indices <- which(factor_column == "")
+  
+  if (length(blank_indices) == 0) {
+    return(factor_column)  # No blanks to fill
+  }
+  
+  # Get non-blank values
+  non_blank_values <- factor_column[factor_column != ""]
+  
+  if (length(non_blank_values) == 0) {
+    warning("All values in the column are blank. Cannot fill with random values.")
+    return(factor_column)
+  }
+  
+  # Calculate probabilities based on frequency of non-blank values
+  value_probs <- table(non_blank_values) / length(non_blank_values)
+  
+  # Randomly sample values based on their probabilities
+  filled_values <- sample(names(value_probs), 
+                          size = length(blank_indices), 
+                          prob = value_probs, 
+                          replace = TRUE)
+  
+  # Replace blank entries with sampled values
+  factor_column[blank_indices] <- filled_values
+  
+  return(factor_column)
+}
+
+# Function to fill blanks in multiple categorical columns
+fill_blanks_in_dataframe <- function(df, categorical_cols) {
+  for (col in categorical_cols) {
+    df[[col]] <- fill_blank_factors(df[[col]])
+  }
+  return(df)
+}
+
+survey <- fill_blanks_in_dataframe(survey, categorical_cols)
+```
+
+```{r, include=F}
+blank_count <-sapply(survey, function(y) sum(length(which(y==""))))
+blank_count <- data.frame(blank_count)
+blank_count
+```
+
+```{r, include=F}
+#merging survey and usage data
+
+df_full=merge(survey, usage, by="user_id")
+cols_to_keep=c("user_id", "daily_goal", "highest_course_progress", "took_placement_test", "purchased_subscription", "highest_crown_count", "n_active_days", "n_lessons_completed", "n_days_on_platform", "percent_days_active", "employment_bin", "primary_language_proficiency_num", "annual_income_cont", "likert_cont", "age_num", "is_student", "uses_other_resources")
+df_final=df_full[cols_to_keep]
+```
+
+
+```{r, include=F}
+drop_duplicate_user_ids <- function(df, user_id_column = "user_id") {
+  # Check if the user_id column exists
+  if (!user_id_column %in% names(df)) {
+    stop(paste("Column", user_id_column, "not found in the dataframe"))
+  }
+  
+  # Keep only the rows where user_id is not duplicated
+  df_no_duplicates <- df[!duplicated(df[[user_id_column]]), ]
+  
+  # Print info about how many rows were dropped
+  n_dropped <- nrow(df) - nrow(df_no_duplicates)
+  cat("Dropped", n_dropped, "rows with duplicate user_ids\n")
+  
+  # Return the dataframe with duplicates removed
+  return(df_no_duplicates)
+}
+
+df_final=drop_duplicate_user_ids(df_final)
+```
+
+```{r, include=F}
+blank_count <-sapply(df_final, function(y) sum(length(which(y==""))))
+blank_count <- data.frame(blank_count)
+blank_count
+```
+
+
+```{r, include=F}
+na_count <-sapply(df_final, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+na_count
+```
+
+```{r, include=F}
+#getting rid of negative values
+
+df_final[which(df_final$highest_course_progress<0), which(colnames(df_final)=="highest_course_progress")]=0
+```
+
+
+```{r, include=F}
+#converting T/F to numerical
+
+df_final$purchased_subscription=ifelse(df_final$purchased_subscription==TRUE,1,0)
+df_final$took_placement_test=ifelse(df_final$took_placement_test==TRUE,1,0)
+```
+
+
+
+```{r, include=F}
+#getting rid of user_id
+
+df_final=df_final[,2:ncol(df_final)]
+```
+
+```{r, include=F}
+#columns to create cor plot
+
+subset_non_binary_columns <- function(df, tolerance = 1e-6) {
+  # Function to check if a column is binary
+  is_binary <- function(x) {
+    unique_values <- unique(x[!is.na(x)])
+    return(length(unique_values) <= 2 &&
+           all(abs(unique_values - round(unique_values)) < tolerance))
+  }
+  
+  # Identify non-binary columns
+  non_binary_cols <- sapply(df, function(col) !is_binary(col))
+  
+  # Subset the dataframe
+  df_subset <- df[, non_binary_cols, drop = FALSE]
+  
+  return(df_subset)
+}
+
+# Usage example:
+df_non_binary <- subset_non_binary_columns(df_final)
+```
+
+```{r, include=F}
+corrplot(cor(df_non_binary))
+```
+
+Given the high number of features, not all are likely to be relevant. Using a dimension reduction method addresses this while also allowing us to make choices about how many clusters to have and to see how different they are from each other.
+We will use principal component analysis for its interpretability and relative simplicity.
+
+```{r, include=F}
+#running pca
+
+df_final_scaled=scale(df_final)
+pca_out=prcomp(df_final_scaled)
+fviz_eig(pca_out)
+```
+
+```{r, include=F}
+fviz_cos2(pca_out, choice = "var", axes = 1:2)
+```
+
+Of the first two components only about 30% of the total variance in the data is retained, so if we were to use all of the original data instead we might produce very different clusters using the same methods. 
+
+```{r, include=F}
+#putting pca scores into matrix to do clustering
+
+pca_scores=pca_out$x[,1:2]
+dist_mat <- dist(pca_scores, method = 'euclidean')
+```
+
+```{r, include=F}
+#running clustering, first with average linkage
+
+hclust_avg <- hclust(dist_mat, method = 'average')
+plot(hclust_avg)
+```
+
+```{r, include=F}
+cut_avg <- cutree(hclust_avg, k = 3)
+
+plot(hclust_avg)
+rect.hclust(hclust_avg , k = 3, border = 2:6)
+abline(h = 5, col = 'red')
+
+train_cl_avg <- mutate(df_final, cluster = cut_avg)
+count(train_cl_avg,cluster)
+```
+
+
+```{r, include=F}
+#trying to get more even clusters with squared distance
+
+hclust_ward <- hclust(dist_mat, method = 'ward.D2')
+plot(hclust_ward <- hclust(dist_mat, method = 'ward.D2')
+)
+```
+
+```{r, include=F}
+#seeing how many users in each cluster
+
+cut_ward <- cutree(hclust_ward, k = 4)
+train_cl_ward <- mutate(df_final, cluster = cut_ward)
+count(train_cl_ward,cluster)
+```
+
+To cluster the data we first use hierarchical clustering to find cluster centers, and then K-means in order to ensure stable clusters. The number of clusters was chosen visually with a scree plot.
+
+
+```{r, include=F}
+# Decide how many clusters to look at
+n_clusters <- 10
+
+# Initialize total within sum of squares error: wss
+wss <- numeric(n_clusters)
+
+set.seed(123)
+
+# Look over 1 to n possible clusters
+for (k in 1:n_clusters) {
+  # Cut the tree for the current number of clusters
+  cluster_assignments <- cutree(hclust_ward, k = k)
+  
+  # Calculate cluster centers
+  cluster_centers <- matrix(0, nrow = k, ncol = ncol(pca_scores))
+  for (i in 1:k) {
+    cluster_data <- pca_scores[cluster_assignments == i, , drop = FALSE]
+    cluster_centers[i, ] <- colMeans(cluster_data)
+  }
+  
+  # Fit the model using the calculated centers
+  km.out <- kmeans(pca_scores, centers = cluster_centers, iter.max = 30)
+  
+  # Save the within cluster sum of squares
+  wss[k] <- km.out$tot.withinss
+}
+
+wss_df <- tibble(clusters = 1:n_clusters, wss = wss)
+
+scree_plot <- ggplot(wss_df, aes(x = clusters, y = wss, group = 1)) +
+  geom_point(size = 4) +
+  geom_line() +
+  scale_x_continuous(breaks = c(2, 4, 6, 8, 10)) +
+  xlab('Number of clusters') +
+  ylab('Within-cluster Sum of Squares')
+
+print(scree_plot)
+```
+ 
+
+```{r, include=F}
+#choosing final cluster count, assigning clusters to rows
+
+k=4
+cluster_assignments <- cutree(hclust_ward, k = k)
+cluster_centers <- matrix(0, nrow = k, ncol = ncol(pca_scores))
+for (i in 1:k) {
+    cluster_data <- pca_scores[cluster_assignments == i, , drop = FALSE]
+    cluster_centers[i, ] <- colMeans(cluster_data)
+}
+
+km_out <- kmeans(pca_scores, centers = cluster_centers, iter.max = 30)
+df_final$km_clusters=factor(km_out$cluster)
+```
+
+```{r, include=F}
+#pca plot, would have liked to include but tight on space and not needed for non-technical focus. makes choice of 2 pcs harder to defend, but still useful to have to see even if not in final report.
+
+pca_plot=as.data.frame(pca_scores)
+pca_plot$cluster=df_final$km_clusters
+ggplot(pca_plot, aes(x = PC1, y = PC2, color = as.factor(cluster))) +
+  geom_point() +
+  labs(x = "1st PC",
+       y = "2nd PC",
+       title = "Clusters by First Two Principal Components",
+       color = "Clusters")
+```
+
+```{r, echo=F, fig.width=6, fig.height=3.5}
+# Reshape the data from wide to long format
+df_long <- df_final %>%
+  select(km_clusters, highest_crown_count, highest_course_progress, 
+         n_active_days, n_lessons_completed) %>%
+  pivot_longer(cols = -km_clusters, 
+               names_to = "variable", 
+               values_to = "value")
+
+# Create the plot
+ggplot(df_long, aes(x = value, fill = factor(km_clusters))) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Distribution of Variables by Cluster",
+       x = "Value",
+       y = "Density",
+       fill = "Cluster") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r, echo=F, fig.width=5, fig.height=3.5}
+# Convert variables to binary factors
+df_final_plot <- df_final %>%
+  mutate(
+    purchased_subscription = factor(purchased_subscription, levels = c(0, 1), labels = c("No", "Yes")),
+    employment_bin = factor(employment_bin, levels = c(0, 1), labels = c("Unemployed", "Employed")),
+    is_student = factor(is_student, levels = c(0, 1), labels = c("No", "Yes")),
+    uses_other_resources = factor(uses_other_resources, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+# Prepare the data
+plot_data <- df_final_plot %>%
+  select(km_clusters, purchased_subscription, employment_bin, is_student, uses_other_resources) %>%
+  pivot_longer(cols = -km_clusters, 
+               names_to = "variable", 
+               values_to = "value") %>%
+  group_by(km_clusters, variable, value) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(km_clusters, variable) %>%
+  mutate(proportion = count / sum(count))
+
+# Create the plot
+ggplot(plot_data, aes(x = value, y = proportion, fill = as.factor(km_clusters))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(x = "Factor Levels", 
+       y = "Proportion", 
+       fill = "Cluster",
+       title = "Proportion of Binary Factors by Cluster") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  scale_fill_brewer(palette = "Set1") +
+  scale_y_continuous(labels = scales::percent_format())
+```
+
+By plotting the distribution of the four most represented variables in the top two principal components, as well as the clusters against four binary variables, we can gain insights into the segments we have created. 
+
+Cluster 1: "motivated learners"
+
+Cluster 1 users are the most likely to have a subscription, and have also been active longer while having completed more lessons. This is a key source of revenue for Duolingo.
+
+Cluster 2: "new learners"
+
+Cluster 2 users are new to Duolingo, and as a result haven't completed many lessons or gained many crowns. They are very unlikely to have purchased a subscription.
+
+Cluster 3: "slower learners"
+
+Like cluster 2, these users are fairly likely to have a subscription but haven't completed as many lessons or gained as many crowns. Many are still newer than cluster 1 users, and could move into that group later. As a high proportion are employed, it's possible they have less time to learn.
+
+Cluster 4: "distracted learners"
+
+Cluster 4 users are most likely to be students and to use other resources. They are very unlikely to have a subscription, but have moved fairly far in a course.
+
+Overall, clusters 1 and 3 are most profitable to Duolingo as they are much more likely than 2 or 4 to buy subscriptions. Cluster 2 contains mostly new users; ensuring that a significant portion of them are retained could eventually see them move into cluster 1 or 3 (i.e. buy a subscription). Cluster 4 might offer opportunities in that they have been on Duolingo for longer while also being unlikely to have a subscription. Trying to understand why they are so likely to use other resources could offer insights into product areas that Duolingo could improve in. In addition, roughly 2 in 5 are students, so targeted efforts like student discounts or free trials for students might see this group increase its conversion rates.
